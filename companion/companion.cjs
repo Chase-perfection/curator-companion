@@ -1394,7 +1394,56 @@ function titleCandidates(titleIndex, lines) {
 	}
 	return found;
 }
-const lineMatches = (lines, text) => text.length >= 3 && lines.some((line) => similarity(line, text, OPTION_FLOOR) >= OPTION_FLOOR || line.length >= 10 && text.includes(line) || text.length >= 10 && line.includes(text));
+const lineIsText = (line, text) => text.length >= 3 && (similarity(line, text, OPTION_FLOOR) >= OPTION_FLOOR || line.length >= 10 && text.includes(line) || text.length >= 10 && line.includes(text));
+const lineMatches = (lines, text) => lines.some((line) => lineIsText(line, text));
+/** True while the popup title is still readable: an option tooltip can hide the rest of the popup. */
+function titleVisible(lines, title) {
+	const wanted = normalizeText(title);
+	return wanted.length >= 4 && lines.some((line) => similarity(normalizeText(line), wanted, TITLE_FLOOR) >= TITLE_FLOOR);
+}
+/** Box of each option button text on screen (index = option index), null when not read. */
+function optionBoxes(node, lines, boxes) {
+	const normalized = lines.map(normalizeText);
+	return node.options.map((option) => {
+		const name = normalizeText(option.name);
+		let union = null;
+		normalized.forEach((line, at) => {
+			const box = boxes?.[at];
+			if (!box || !lineIsText(line, name)) return;
+			union = union ? {
+				x: Math.min(union.x, box.x),
+				y: Math.min(union.y, box.y),
+				w: Math.max(union.x + union.w, box.x + box.w) - Math.min(union.x, box.x),
+				h: Math.max(union.y + union.h, box.y + box.h) - Math.min(union.y, box.y)
+			} : { ...box };
+		});
+		return union;
+	});
+}
+/**
+* Option whose button was under the click, or null. Buttons span the popup width with the text centred, so the
+* vertical distance to the text decides, within a generous horizontal band around the option texts.
+*/
+function optionAt(click, boxes) {
+	const known = boxes.map((box, index) => box && {
+		box,
+		index
+	}).filter(Boolean);
+	if (!click || !known.length) return null;
+	const left = Math.min(...known.map(({ box }) => box.x)) - 300;
+	const right = Math.max(...known.map(({ box }) => box.x + box.w)) + 300;
+	if (click.x < left || click.x > right) return null;
+	let best = null;
+	for (const { box, index } of known) {
+		const distance = Math.abs(click.y - (box.y + box.h / 2));
+		if (distance > Math.max(box.h / 2 + 10, 14) * 1.2) continue;
+		if (!best || distance < best.distance) best = {
+			index,
+			distance
+		};
+	}
+	return best?.index ?? null;
+}
 /** The event whose popup is on screen, or null. `ctx` is the quest graph context ({ loc, context }). */
 function matchPopup(lines, index, titleIndex, ctx) {
 	const normalized = lines.map(normalizeText).filter((line) => line.length >= 3);
@@ -1420,22 +1469,30 @@ function matchPopup(lines, index, titleIndex, ctx) {
 }
 //#endregion
 //#region scripts/lib/livePopup.mjs
-const CLOSE_AFTER = 2;
+const CLOSE_AFTER = 3;
+const KEEP_CHOICES = 50;
 var LivePopupTracker = class {
+	/** Last popup seen: stays after it closes (open: false) so the site keeps showing it with the choice made. */
 	popup = null;
 	status = "starting";
+	/** nodeId -> option index picked in game, as read from the screen (newest last). */
+	choices = /* @__PURE__ */ new Map();
 	misses = 0;
+	boxes = [];
+	pendingClick = null;
 	titleIndex = null;
 	queue = Promise.resolve();
-	constructor({ getBuild, onChange, loadGame = defaultGame }) {
+	constructor({ getBuild, onChange, loadGame = defaultGame, now = () => /* @__PURE__ */ new Date() }) {
 		this.getBuild = getBuild;
 		this.onChange = onChange;
 		this.loadGame = loadGame;
+		this.now = now;
 	}
 	state() {
 		return {
 			popup: this.popup,
-			status: this.status
+			status: this.status,
+			choices: Object.fromEntries(this.choices)
 		};
 	}
 	/** OCR messages are handled one at a time, in order. */
@@ -1444,38 +1501,80 @@ var LivePopupTracker = class {
 		return this.queue;
 	}
 	async #handle(message) {
-		if (message.state !== "ok") return this.#set(this.popup, message.state === "error" ? `error:${message.message ?? ""}` : message.state);
+		if (message.state !== "ok") return this.#emit(message.state === "error" ? `error:${message.message ?? ""}` : message.state);
 		const { index, loc } = await this.loadGame();
-		if (!index) return this.#set(null, "no_game");
+		if (!index) return this.#emit("no_game");
 		this.titleIndex ??= buildTitleIndex(index, loc);
 		const ctx = {
 			loc,
 			context: buildContext(this.getBuild())
 		};
 		const match = matchPopup(message.lines, index, this.titleIndex, ctx);
-		if (match) {
-			this.misses = 0;
-			const nodeId = `event:${match.eventId}`;
-			if (this.popup?.nodeId === nodeId) return this.#set(this.popup, "watching");
+		const open = this.popup?.open ? this.popup : null;
+		const nodeId = match ? `event:${match.eventId}` : null;
+		if (open && nodeId === open.nodeId) {
+			this.#see(open, message);
+			return this.#emit("watching");
+		}
+		if (open && !nodeId && titleVisible(message.lines, open.title)) {
+			this.#see(open, message, false);
+			return this.#emit("watching");
+		}
+		if (open) {
+			const choice = optionAt(message.click ?? this.pendingClick, this.boxes);
+			if (choice === null && !nodeId && ++this.misses < CLOSE_AFTER) return this.#emit("watching");
+			this.#close(open, choice);
+		}
+		if (nodeId) {
 			const nodes = expandNodes(index, [nodeId], ctx, {
 				maxDepth: 2,
 				maxNodes: 40
 			});
-			return this.#set({
+			const popup = {
 				nodeId,
 				title: match.title,
 				nodes,
-				detectedAt: (/* @__PURE__ */ new Date()).toISOString()
-			}, "watching");
+				detectedAt: this.now().toISOString(),
+				open: true,
+				choice: null
+			};
+			this.boxes = [];
+			this.#see(popup, message);
+			this.popup = popup;
 		}
-		if (this.popup && ++this.misses < CLOSE_AFTER) return this.#set(this.popup, "watching");
-		return this.#set(null, "watching");
+		return this.#emit("watching", true);
 	}
-	#set(popup, status) {
-		if (popup === this.popup && status === this.status) return;
-		this.popup = popup;
+	#see(popup, message, readBoxes = true) {
+		this.misses = 0;
+		this.pendingClick = message.click ?? null;
+		if (!readBoxes) return;
+		const node = popup.nodes[popup.nodeId];
+		if (!node) return;
+		const seen = optionBoxes(node, message.lines, message.boxes);
+		this.boxes = node.options.map((_, at) => seen[at] ?? this.boxes[at] ?? null);
+	}
+	#close(popup, choice) {
+		this.popup = {
+			...popup,
+			open: false,
+			choice,
+			closedAt: this.now().toISOString()
+		};
+		if (choice !== null) {
+			this.choices.delete(popup.nodeId);
+			this.choices.set(popup.nodeId, choice);
+			while (this.choices.size > KEEP_CHOICES) this.choices.delete(this.choices.keys().next().value);
+		}
+		this.boxes = [];
+		this.pendingClick = null;
+		this.misses = 0;
+		this.changed = true;
+	}
+	#emit(status, changed = false) {
+		const dirty = changed || this.changed || status !== this.status;
+		this.changed = false;
 		this.status = status;
-		this.onChange(this.state());
+		if (dirty) this.onChange(this.state());
 	}
 };
 async function defaultGame() {
@@ -1491,7 +1590,7 @@ const OCR_SCRIPT = String.raw`
 param([string]$Language = 'fr-FR', [string]$ProcessPattern = '^stellaris', [int]$IntervalMs = 700, [string]$ImagePath = '', [int]$ParentId = 0)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-function Emit($value) { [Console]::Out.WriteLine(($value | ConvertTo-Json -Compress -Depth 4)); [Console]::Out.Flush() }
+function Emit($value) { [Console]::Out.WriteLine(($value | ConvertTo-Json -Compress -Depth 5)); [Console]::Out.Flush() }
 try {
   Add-Type -AssemblyName System.Drawing
   Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -1505,10 +1604,13 @@ using System;
 using System.Runtime.InteropServices;
 public static class CuratorWin {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
 }
 '@
   $null = [CuratorWin]::SetProcessDPIAware()
@@ -1519,6 +1621,7 @@ public static class CuratorWin {
 
 function Read-Bitmap($bitmap) {
   $max = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
+  $scale = 1.0
   if ($bitmap.Width -gt $max -or $bitmap.Height -gt $max) {
     $scale = [Math]::Min($max / $bitmap.Width, $max / $bitmap.Height)
     $resized = New-Object System.Drawing.Bitmap $bitmap, ([int]($bitmap.Width * $scale)), ([int]($bitmap.Height * $scale))
@@ -1533,12 +1636,32 @@ function Read-Bitmap($bitmap) {
   $software = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
   $result = Await ($engine.RecognizeAsync($software)) ([Windows.Media.Ocr.OcrResult])
   $software.Dispose(); $memory.Dispose()
-  return ,@($result.Lines | ForEach-Object { $_.Text })
+  $lines = foreach ($line in $result.Lines) {
+    $left = [double]::MaxValue; $top = [double]::MaxValue; $right = 0.0; $bottom = 0.0
+    foreach ($word in $line.Words) {
+      $box = $word.BoundingRect
+      $left = [Math]::Min($left, $box.X); $top = [Math]::Min($top, $box.Y)
+      $right = [Math]::Max($right, $box.X + $box.Width); $bottom = [Math]::Max($bottom, $box.Y + $box.Height)
+    }
+    @{ t = $line.Text; x = [int]($left / $scale); y = [int]($top / $scale); w = [int](($right - $left) / $scale); h = [int](($bottom - $top) / $scale) }
+  }
+  return ,@($lines)
 }
 
-if ($ImagePath) { Emit @{ state = 'ok'; lines = (Read-Bitmap (New-Object System.Drawing.Bitmap $ImagePath)) }; exit 0 }
+if ($ImagePath) { Emit @{ state = 'ok'; lines = (Read-Bitmap (New-Object System.Drawing.Bitmap $ImagePath)); click = $null }; exit 0 }
 
 $last = ''
+$gameWindow = [IntPtr]::Zero
+$rect = New-Object CuratorWin+RECT
+$click = $null
+$wasDown = $false
+function Get-Click($window, $windowRect) {
+  # Only clicks made in Stellaris: a click on the site is not a choice.
+  if ($window -eq [IntPtr]::Zero -or [CuratorWin]::GetForegroundWindow() -ne $window) { return $null }
+  $point = New-Object CuratorWin+POINT
+  $null = [CuratorWin]::GetCursorPos([ref]$point)
+  return @{ x = $point.X - $windowRect.Left; y = $point.Y - $windowRect.Top }
+}
 while ($true) {
   # Windows does not end child processes with their parent: stop when the companion is gone.
   if ($ParentId -and -not (Get-Process -Id $ParentId -ErrorAction SilentlyContinue)) { exit 0 }
@@ -1547,9 +1670,9 @@ while ($true) {
     $processId = [uint32]0
     $null = [CuratorWin]::GetWindowThreadProcessId($hwnd, [ref]$processId)
     $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
-    if (-not $process -or $process.ProcessName -notmatch $ProcessPattern) { $message = @{ state = 'background' } }
+    if (-not $process -or $process.ProcessName -notmatch $ProcessPattern) { $gameWindow = [IntPtr]::Zero; $message = @{ state = 'background' } }
     else {
-      $rect = New-Object CuratorWin+RECT
+      $gameWindow = $hwnd
       $null = [CuratorWin]::GetWindowRect($hwnd, [ref]$rect)
       $width = $rect.Right - $rect.Left; $height = $rect.Bottom - $rect.Top
       if ($width -lt 200 -or $height -lt 200) { $message = @{ state = 'background' } }
@@ -1562,13 +1685,21 @@ while ($true) {
         $lit = 0
         foreach ($x in 1..8) { foreach ($y in 1..8) { $pixel = $bitmap.GetPixel([int]($width * $x / 9), [int]($height * $y / 9)); if ($pixel.R + $pixel.G + $pixel.B -gt 30) { $lit++ } } }
         if ($lit -eq 0) { $bitmap.Dispose(); $message = @{ state = 'black' } }
-        else { $message = @{ state = 'ok'; lines = (Read-Bitmap $bitmap) } }
+        else { $message = @{ state = 'ok'; lines = (Read-Bitmap $bitmap); click = $click }; $click = $null }
       }
     }
   } catch { $message = @{ state = 'error'; message = $_.Exception.Message } }
-  $json = $message | ConvertTo-Json -Compress -Depth 4
+  $json = $message | ConvertTo-Json -Compress -Depth 5
   if ($json -ne $last) { [Console]::Out.WriteLine($json); [Console]::Out.Flush(); $last = $json }
-  Start-Sleep -Milliseconds $IntervalMs
+  # Wait in small steps to catch every click; the low bit reports one made while the OCR was running.
+  if (([CuratorWin]::GetAsyncKeyState(1) -band 1) -ne 0) { $clicked = Get-Click $gameWindow $rect; if ($clicked) { $click = $clicked } }
+  $until = [DateTime]::UtcNow.AddMilliseconds($IntervalMs)
+  while ([DateTime]::UtcNow -lt $until) {
+    $down = ([CuratorWin]::GetAsyncKeyState(1) -band 0x8000) -ne 0
+    if ($down -and -not $wasDown) { $clicked = Get-Click $gameWindow $rect; if ($clicked) { $click = $clicked } }
+    $wasDown = $down
+    Start-Sleep -Milliseconds 25
+  }
 }
 `;
 function ocrArguments(options = {}) {
@@ -1588,16 +1719,32 @@ function ocrArguments(options = {}) {
 		Buffer.from(wrapped, "utf16le").toString("base64")
 	];
 }
-/** One parsed message per stdout line; `lines` is always an array (ConvertTo-Json unwraps single-item arrays). */
+/**
+* One parsed message per stdout line. For "ok": `lines` = texts, `boxes` = their window-relative boxes (same order),
+* `click` = { x, y } or null. ConvertTo-Json unwraps single-item arrays, hence the flat().
+*/
 function parseOcrMessage(line) {
 	let message;
 	try {
-		message = JSON.parse(line.replace(/^﻿/, ""));
+		message = JSON.parse(line.replace(/^\uFEFF/, ""));
 	} catch {
 		return null;
 	}
 	if (!message || typeof message.state !== "string") return null;
-	if (message.state === "ok") message.lines = [message.lines ?? []].flat().filter((text) => typeof text === "string");
+	if (message.state === "ok") {
+		const raw = [message.lines ?? []].flat().filter((item) => typeof item === "string" || typeof item?.t === "string");
+		message.lines = raw.map((item) => typeof item === "string" ? item : item.t);
+		message.boxes = raw.map((item) => typeof item === "string" ? null : {
+			x: item.x,
+			y: item.y,
+			w: item.w,
+			h: item.h
+		});
+		message.click = Number.isFinite(message.click?.x) && Number.isFinite(message.click?.y) ? {
+			x: message.click.x,
+			y: message.click.y
+		} : null;
+	}
 	return message;
 }
 /** Runs the OCR loop until stopped, restarting it if PowerShell dies. Windows only; returns a stop function. */
@@ -1645,7 +1792,7 @@ function watchScreen(onMessage, options = {}) {
 }
 //#endregion
 //#region scripts/localCompanion.mjs
-const companionVersion = "0.5.1";
+const companionVersion = "0.5.2";
 process.title = `Curator Companion v${companionVersion}`;
 const host = "127.0.0.1";
 const port = Number.parseInt(process.env.CURATOR_COMPANION_PORT ?? "43123", 10);
