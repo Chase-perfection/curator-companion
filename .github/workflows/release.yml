@@ -1,0 +1,50 @@
+# Builds CuratorCompanion.exe on Windows from the public stellaris-advisor sources and publishes it as the latest release.
+name: Release companion
+
+on:
+  push:
+    branches: [chase/serene-shannon-h1gwo1]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: stellaris-advisor branch, tag or commit to build
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Chase-perfection/stellaris-advisor
+          ref: ${{ inputs.ref || 'b3cde1cc007f4c03afac785a34767ff97ceb604c' }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Build
+        run: node scripts/buildCompanion.mjs
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $env:CURATOR_COMPANION_PORT = "43990"
+          $process = Start-Process -FilePath "release/CuratorCompanion-$version.exe" -PassThru
+          Start-Sleep -Seconds 5
+          $health = curl.exe -sS -H "Origin: http://localhost:5173" http://127.0.0.1:43990/health
+          Stop-Process -Id $process.Id
+          Write-Output $health
+          if (($health | ConvertFrom-Json).version -ne $version) { throw "Companion reports '$health', expected $version" }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          gh release view "v$version" --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { Write-Output "v$version already published"; exit 0 }
+          gh release create "v$version" "release/CuratorCompanion.exe" "release/CuratorCompanion-$version.exe" --repo $env:GITHUB_REPOSITORY --title "Curator Companion $version" --notes "Compagnon $version : lecture des quêtes, version affichée dans la console." --latest
