@@ -4,6 +4,7 @@ let node_fs_promises = require("node:fs/promises");
 let node_path = require("node:path");
 let node_crypto = require("node:crypto");
 let node_util = require("node:util");
+let node_readline = require("node:readline");
 //#region scripts/lib/gameLocalisation.mjs
 async function findGameRoot(environment = process.env) {
 	const steamRoots = ["C:/Program Files (x86)/Steam", "C:/Program Files/Steam"];
@@ -1326,8 +1327,325 @@ async function isStellarisRunning() {
 	}
 }
 //#endregion
+//#region scripts/lib/popupMatcher.mjs
+const normalizeText = (text) => (text ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/œ/g, "oe").replace(/[^a-z0-9]+/g, " ").trim();
+/** Similarity in [0, 1] from the Levenshtein distance; 0 as soon as it cannot reach `floor`. */
+function similarity(a, b, floor = 0) {
+	if (a === b) return 1;
+	const longest = Math.max(a.length, b.length);
+	if (!longest) return 1;
+	const budget = Math.floor(longest * (1 - floor));
+	if (Math.abs(a.length - b.length) > budget) return 0;
+	let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+	for (let i = 1; i <= a.length; i += 1) {
+		const current = [i];
+		let rowBest = i;
+		for (let j = 1; j <= b.length; j += 1) {
+			current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+			rowBest = Math.min(rowBest, current[j]);
+		}
+		if (rowBest > budget) return 0;
+		previous = current;
+	}
+	return 1 - previous[b.length] / longest;
+}
+const TITLE_KEYS = /\btitle\s*=\s*(?:"([^"]+)"|([\w.\-]+)|\{[^{}]*?\btext\s*=\s*"?([\w.\-]+))/g;
+/** Normalized visible title -> event ids, for every popup the game can show (hidden events excluded). */
+function buildTitleIndex(index, loc) {
+	const titles = /* @__PURE__ */ new Map();
+	for (const [id, record] of index?.events ?? []) {
+		const body = record.text.slice(record.block.start, record.block.end);
+		if (/\bhide_window\s*=\s*yes\b/.test(body)) continue;
+		for (const match of body.matchAll(TITLE_KEYS)) {
+			const title = normalizeText(localize(loc, match[1] ?? match[2] ?? match[3]));
+			if (title.length < 4) continue;
+			if (!titles.has(title)) titles.set(title, /* @__PURE__ */ new Set());
+			titles.get(title).add(id);
+		}
+	}
+	const byLength = /* @__PURE__ */ new Map();
+	for (const title of titles.keys()) {
+		if (!byLength.has(title.length)) byLength.set(title.length, []);
+		byLength.get(title.length).push(title);
+	}
+	return {
+		titles,
+		byLength
+	};
+}
+const TITLE_FLOOR = .82;
+const OPTION_FLOOR = .78;
+function titleCandidates(titleIndex, lines) {
+	const found = /* @__PURE__ */ new Map();
+	const add = (title, score) => {
+		for (const id of titleIndex.titles.get(title)) if ((found.get(id) ?? 0) < score) found.set(id, score);
+	};
+	for (const line of lines) {
+		if (titleIndex.titles.has(line)) {
+			add(line, 1);
+			continue;
+		}
+		if (line.length < 6) continue;
+		const spread = Math.max(2, Math.ceil(line.length * .18000000000000005));
+		for (let length = line.length - spread; length <= line.length + spread; length += 1) for (const title of titleIndex.byLength.get(length) ?? []) {
+			const score = similarity(line, title, TITLE_FLOOR);
+			if (score >= TITLE_FLOOR) add(title, score);
+		}
+	}
+	return found;
+}
+const lineMatches = (lines, text) => text.length >= 3 && lines.some((line) => similarity(line, text, OPTION_FLOOR) >= OPTION_FLOOR || line.length >= 10 && text.includes(line) || text.length >= 10 && line.includes(text));
+/** The event whose popup is on screen, or null. `ctx` is the quest graph context ({ loc, context }). */
+function matchPopup(lines, index, titleIndex, ctx) {
+	const normalized = lines.map(normalizeText).filter((line) => line.length >= 3);
+	if (!normalized.length) return null;
+	const words = new Set(normalized.flatMap((line) => line.split(" ")));
+	let best = null;
+	for (const [id, titleScore] of [...titleCandidates(titleIndex, normalized)].sort((a, b) => b[1] - a[1]).slice(0, 40)) {
+		const node = eventNode(index, id, ctx);
+		if (!node) continue;
+		const options = node.options.map((option) => normalizeText(option.name)).filter((name) => !/^option \d+$/.test(name));
+		const optionHits = options.filter((name) => lineMatches(normalized, name)).length;
+		const descWords = normalizeText(node.desc).split(" ").filter((word) => word.length >= 4).slice(0, 40);
+		const descHits = descWords.length ? descWords.filter((word) => words.has(word)).length / descWords.length : 0;
+		if (optionHits === 0 && descHits < .5) continue;
+		const score = titleScore * 2 + (options.length ? optionHits / options.length : 0) + descHits;
+		if (!best || score > best.score) best = {
+			eventId: id,
+			score,
+			title: node.title
+		};
+	}
+	return best;
+}
+//#endregion
+//#region scripts/lib/livePopup.mjs
+const CLOSE_AFTER = 2;
+var LivePopupTracker = class {
+	popup = null;
+	status = "starting";
+	misses = 0;
+	titleIndex = null;
+	queue = Promise.resolve();
+	constructor({ getBuild, onChange, loadGame = defaultGame }) {
+		this.getBuild = getBuild;
+		this.onChange = onChange;
+		this.loadGame = loadGame;
+	}
+	state() {
+		return {
+			popup: this.popup,
+			status: this.status
+		};
+	}
+	/** OCR messages are handled one at a time, in order. */
+	handle(message) {
+		this.queue = this.queue.then(() => this.#handle(message)).catch(() => void 0);
+		return this.queue;
+	}
+	async #handle(message) {
+		if (message.state !== "ok") return this.#set(this.popup, message.state === "error" ? `error:${message.message ?? ""}` : message.state);
+		const { index, loc } = await this.loadGame();
+		if (!index) return this.#set(null, "no_game");
+		this.titleIndex ??= buildTitleIndex(index, loc);
+		const ctx = {
+			loc,
+			context: buildContext(this.getBuild())
+		};
+		const match = matchPopup(message.lines, index, this.titleIndex, ctx);
+		if (match) {
+			this.misses = 0;
+			const nodeId = `event:${match.eventId}`;
+			if (this.popup?.nodeId === nodeId) return this.#set(this.popup, "watching");
+			const nodes = expandNodes(index, [nodeId], ctx, {
+				maxDepth: 2,
+				maxNodes: 40
+			});
+			return this.#set({
+				nodeId,
+				title: match.title,
+				nodes,
+				detectedAt: (/* @__PURE__ */ new Date()).toISOString()
+			}, "watching");
+		}
+		if (this.popup && ++this.misses < CLOSE_AFTER) return this.#set(this.popup, "watching");
+		return this.#set(null, "watching");
+	}
+	#set(popup, status) {
+		if (popup === this.popup && status === this.status) return;
+		this.popup = popup;
+		this.status = status;
+		this.onChange(this.state());
+	}
+};
+async function defaultGame() {
+	const [index, loc] = await Promise.all([gameQuestIndex(), gameLocalisation()]);
+	return {
+		index,
+		loc
+	};
+}
+//#endregion
+//#region scripts/lib/screenWatch.mjs
+const OCR_SCRIPT = String.raw`
+param([string]$Language = 'fr-FR', [string]$ProcessPattern = '^stellaris', [int]$IntervalMs = 700, [string]$ImagePath = '', [int]$ParentId = 0)
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+function Emit($value) { [Console]::Out.WriteLine(($value | ConvertTo-Json -Compress -Depth 4)); [Console]::Out.Flush() }
+try {
+  Add-Type -AssemblyName System.Drawing
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+  $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+  $null = [Windows.Globalization.Language, Windows.Foundation, ContentType = WindowsRuntime]
+  $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+  $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -like 'IAsyncOperation*' } | Select-Object -First 1
+  function Await($operation, [Type]$type) { $task = $asTask.MakeGenericMethod($type).Invoke($null, @($operation)); $null = $task.Wait(-1); $task.Result }
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CuratorWin {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}
+'@
+  $null = [CuratorWin]::SetProcessDPIAware()
+  $wanted = New-Object Windows.Globalization.Language $Language
+  $engine = if ([Windows.Media.Ocr.OcrEngine]::IsLanguageSupported($wanted)) { [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($wanted) } else { [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }
+  if (-not $engine) { Emit @{ state = 'error'; message = 'no_ocr_language' }; exit 2 }
+} catch { Emit @{ state = 'error'; message = $_.Exception.Message }; exit 2 }
+
+function Read-Bitmap($bitmap) {
+  $max = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
+  if ($bitmap.Width -gt $max -or $bitmap.Height -gt $max) {
+    $scale = [Math]::Min($max / $bitmap.Width, $max / $bitmap.Height)
+    $resized = New-Object System.Drawing.Bitmap $bitmap, ([int]($bitmap.Width * $scale)), ([int]($bitmap.Height * $scale))
+    $bitmap.Dispose(); $bitmap = $resized
+  }
+  $memory = New-Object System.IO.MemoryStream
+  $bitmap.Save($memory, [System.Drawing.Imaging.ImageFormat]::Bmp)
+  $bitmap.Dispose()
+  $memory.Position = 0
+  $stream = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($memory)
+  $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+  $software = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+  $result = Await ($engine.RecognizeAsync($software)) ([Windows.Media.Ocr.OcrResult])
+  $software.Dispose(); $memory.Dispose()
+  return ,@($result.Lines | ForEach-Object { $_.Text })
+}
+
+if ($ImagePath) { Emit @{ state = 'ok'; lines = (Read-Bitmap (New-Object System.Drawing.Bitmap $ImagePath)) }; exit 0 }
+
+$last = ''
+while ($true) {
+  # Windows does not end child processes with their parent: stop when the companion is gone.
+  if ($ParentId -and -not (Get-Process -Id $ParentId -ErrorAction SilentlyContinue)) { exit 0 }
+  try {
+    $hwnd = [CuratorWin]::GetForegroundWindow()
+    $processId = [uint32]0
+    $null = [CuratorWin]::GetWindowThreadProcessId($hwnd, [ref]$processId)
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    if (-not $process -or $process.ProcessName -notmatch $ProcessPattern) { $message = @{ state = 'background' } }
+    else {
+      $rect = New-Object CuratorWin+RECT
+      $null = [CuratorWin]::GetWindowRect($hwnd, [ref]$rect)
+      $width = $rect.Right - $rect.Left; $height = $rect.Bottom - $rect.Top
+      if ($width -lt 200 -or $height -lt 200) { $message = @{ state = 'background' } }
+      else {
+        $bitmap = New-Object System.Drawing.Bitmap $width, $height
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+        $graphics.Dispose()
+        # Exclusive fullscreen hands GDI a black frame.
+        $lit = 0
+        foreach ($x in 1..8) { foreach ($y in 1..8) { $pixel = $bitmap.GetPixel([int]($width * $x / 9), [int]($height * $y / 9)); if ($pixel.R + $pixel.G + $pixel.B -gt 30) { $lit++ } } }
+        if ($lit -eq 0) { $bitmap.Dispose(); $message = @{ state = 'black' } }
+        else { $message = @{ state = 'ok'; lines = (Read-Bitmap $bitmap) } }
+      }
+    }
+  } catch { $message = @{ state = 'error'; message = $_.Exception.Message } }
+  $json = $message | ConvertTo-Json -Compress -Depth 4
+  if ($json -ne $last) { [Console]::Out.WriteLine($json); [Console]::Out.Flush(); $last = $json }
+  Start-Sleep -Milliseconds $IntervalMs
+}
+`;
+function ocrArguments(options = {}) {
+	const parameters = [];
+	if (options.language) parameters.push("-Language", options.language);
+	if (options.processPattern) parameters.push("-ProcessPattern", options.processPattern);
+	if (options.intervalMs) parameters.push("-IntervalMs", String(options.intervalMs));
+	if (options.imagePath) parameters.push("-ImagePath", options.imagePath);
+	if (options.parentId) parameters.push("-ParentId", String(options.parentId));
+	const wrapped = `& { ${OCR_SCRIPT} } ${parameters.map((value) => value.startsWith("-") ? value : `'${value.replaceAll("'", "''")}'`).join(" ")}`;
+	return [
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-EncodedCommand",
+		Buffer.from(wrapped, "utf16le").toString("base64")
+	];
+}
+/** One parsed message per stdout line; `lines` is always an array (ConvertTo-Json unwraps single-item arrays). */
+function parseOcrMessage(line) {
+	let message;
+	try {
+		message = JSON.parse(line.replace(/^﻿/, ""));
+	} catch {
+		return null;
+	}
+	if (!message || typeof message.state !== "string") return null;
+	if (message.state === "ok") message.lines = [message.lines ?? []].flat().filter((text) => typeof text === "string");
+	return message;
+}
+/** Runs the OCR loop until stopped, restarting it if PowerShell dies. Windows only; returns a stop function. */
+function watchScreen(onMessage, options = {}) {
+	if (process.platform !== "win32") {
+		onMessage({ state: "unsupported" });
+		return () => void 0;
+	}
+	let child = null;
+	let stopped = false;
+	let restarts = 0;
+	const start = () => {
+		child = (0, node_child_process.spawn)("powershell.exe", ocrArguments({
+			parentId: process.pid,
+			...options
+		}), {
+			windowsHide: true,
+			stdio: [
+				"ignore",
+				"pipe",
+				"pipe"
+			]
+		});
+		(0, node_readline.createInterface)({ input: child.stdout }).on("line", (line) => {
+			const message = parseOcrMessage(line);
+			if (!message) return;
+			if (message.state === "ok") restarts = 0;
+			onMessage(message);
+		});
+		child.stderr.resume();
+		child.on("exit", (code) => {
+			if (stopped) return;
+			if (code === 2 || restarts >= 5) return;
+			restarts += 1;
+			setTimeout(start, 2e3 * restarts).unref?.();
+		});
+	};
+	start();
+	const stop = () => {
+		stopped = true;
+		child?.kill();
+	};
+	process.once("exit", stop);
+	return stop;
+}
+//#endregion
 //#region scripts/localCompanion.mjs
-const companionVersion = "0.5.0";
+const companionVersion = "0.5.1";
 process.title = `Curator Companion v${companionVersion}`;
 const host = "127.0.0.1";
 const port = Number.parseInt(process.env.CURATOR_COMPANION_PORT ?? "43123", 10);
@@ -1440,6 +1758,7 @@ var SnapshotMonitor = class {
 			this.timer.unref?.();
 		}
 		response.write("retry: 1500\n\n");
+		this.write(response, "popup", livePopup.state());
 		this.refresh(true).catch((error) => this.write(response, "companion-error", { message: error instanceof Error ? error.message : "Lecture locale indisponible." }));
 	}
 	removeClient(response) {
@@ -1457,6 +1776,10 @@ var SnapshotMonitor = class {
 	}
 };
 const monitor = new SnapshotMonitor();
+const livePopup = new LivePopupTracker({
+	getBuild: () => monitor.snapshot?.build ?? null,
+	onChange: (state) => monitor.broadcast("popup", state)
+});
 setInterval(() => monitor.broadcast("heartbeat", { at: (/* @__PURE__ */ new Date()).toISOString() }), 15e3).unref?.();
 const server = (0, node_http.createServer)(async (request, response) => {
 	const origin = request.headers.origin ?? "";
@@ -1570,6 +1893,8 @@ server.on("error", async (error) => {
 });
 gameQuestIndex();
 server.listen(port, host, () => {
+	if (process.env.CURATOR_SCREEN_WATCH !== "0") watchScreen((message) => void livePopup.handle(message));
+	else livePopup.handle({ state: "disabled" });
 	console.log(`Curator Companion v${companionVersion} écoute sur http://${host}:${port}`);
 	console.log("Temps réel SSE actif. Lecture seule : aucune donnée Stellaris n’est modifiée.");
 });
