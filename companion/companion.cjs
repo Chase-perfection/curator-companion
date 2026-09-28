@@ -876,8 +876,8 @@ async function questNode(id, build) {
 		loc,
 		context: buildContext(build)
 	}, {
-		maxDepth: 2,
-		maxNodes: 40
+		maxDepth: 3,
+		maxNodes: 80
 	});
 }
 //#endregion
@@ -1527,8 +1527,8 @@ var LivePopupTracker = class {
 		}
 		if (nodeId) {
 			const nodes = expandNodes(index, [nodeId], ctx, {
-				maxDepth: 2,
-				maxNodes: 40
+				maxDepth: 3,
+				maxNodes: 80
 			});
 			const popup = {
 				nodeId,
@@ -1792,7 +1792,7 @@ function watchScreen(onMessage, options = {}) {
 }
 //#endregion
 //#region scripts/localCompanion.mjs
-const companionVersion = "0.5.2";
+const companionVersion = "0.5.3";
 process.title = `Curator Companion v${companionVersion}`;
 const host = "127.0.0.1";
 const port = Number.parseInt(process.env.CURATOR_COMPANION_PORT ?? "43123", 10);
