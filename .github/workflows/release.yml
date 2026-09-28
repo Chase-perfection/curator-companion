@@ -1,15 +1,12 @@
-# Builds CuratorCompanion.exe on Windows from the public stellaris-advisor sources and publishes it as the latest release.
+# Wraps companion/companion.cjs (the rolldown bundle of stellaris-advisor's scripts/localCompanion.mjs) into a
+# Windows Node single executable and publishes it as the latest release, under a stable and a versioned name.
 name: Release companion
 
 on:
   push:
     branches: [chase/serene-shannon-h1gwo1]
+    paths: [companion/**, .github/workflows/release.yml]
   workflow_dispatch:
-    inputs:
-      ref:
-        description: stellaris-advisor branch, tag or commit to build
-        required: true
-        default: main
 
 permissions:
   contents: write
@@ -17,34 +14,37 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
-        with:
-          repository: Chase-perfection/stellaris-advisor
-          ref: ${{ inputs.ref || 'b3cde1cc007f4c03afac785a34767ff97ceb604c' }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci
       - name: Build
-        run: node scripts/buildCompanion.mjs
-      - name: Smoke test
-        shell: pwsh
         run: |
-          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $version = (Get-Content companion/VERSION).Trim()
+          New-Item -ItemType Directory -Force release | Out-Null
+          '{"main":"companion/companion.cjs","output":"release/companion.blob","disableExperimentalSEAWarning":true}' | Set-Content release/sea-config.json
+          node --experimental-sea-config release/sea-config.json
+          Copy-Item (Get-Command node).Source release/CuratorCompanion.exe
+          npx --yes postject@1.0.0-alpha.6 release/CuratorCompanion.exe NODE_SEA_BLOB release/companion.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+          Copy-Item release/CuratorCompanion.exe "release/CuratorCompanion-$version.exe"
+          "VERSION=$version" | Add-Content $env:GITHUB_ENV
+      - name: Smoke test
+        run: |
           $env:CURATOR_COMPANION_PORT = "43990"
-          $process = Start-Process -FilePath "release/CuratorCompanion-$version.exe" -PassThru
+          $process = Start-Process -FilePath "release/CuratorCompanion-$env:VERSION.exe" -PassThru
           Start-Sleep -Seconds 5
           $health = curl.exe -sS -H "Origin: http://localhost:5173" http://127.0.0.1:43990/health
           Stop-Process -Id $process.Id
           Write-Output $health
-          if (($health | ConvertFrom-Json).version -ne $version) { throw "Companion reports '$health', expected $version" }
+          if (($health | ConvertFrom-Json).version -ne $env:VERSION) { throw "Companion reports '$health', expected $env:VERSION" }
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
         run: |
-          $version = (Get-Content package.json | ConvertFrom-Json).version
-          gh release view "v$version" --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) { Write-Output "v$version already published"; exit 0 }
-          gh release create "v$version" "release/CuratorCompanion.exe" "release/CuratorCompanion-$version.exe" --repo $env:GITHUB_REPOSITORY --title "Curator Companion $version" --notes "Compagnon $version : lecture des quêtes, version affichée dans la console." --latest
+          gh release view "v$env:VERSION" --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { Write-Output "v$env:VERSION already published"; exit 0 }
+          gh release create "v$env:VERSION" release/CuratorCompanion.exe "release/CuratorCompanion-$env:VERSION.exe" --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Curator Companion $env:VERSION" --notes "Compagnon $env:VERSION : lecture des quêtes, version affichée dans la console et sur le site." --latest
